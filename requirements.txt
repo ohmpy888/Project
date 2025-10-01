@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+pydantic
+# เพิ่ม PyTorch (สำหรับ CPU)
+torch 
+# เพิ่มไลบรารีประมวลผลข้อความที่คุณใช้ (ถ้ามี)
+# เช่น ถ้าใช้ Hugging Face Tokenizer: transformers
+# ถ้าใช้การประมวลผลแบบกำหนดเอง: ให้ติดตั้งตัวช่วยที่จำเป็น

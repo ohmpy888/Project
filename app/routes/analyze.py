@@ -1,13 +1,15 @@
 # app/routes/analyze.py
 # -*- coding: utf-8 -*-
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, status
 from pydantic import BaseModel 
 from typing import List, Dict, Any, Optional
+from datetime import date, datetime
 
 # === Import Dependencies & Logic ===
-from app.schemas import ChallengeSubmission, AnalyzeOut  # นำเข้า Schema ที่ปรับปรุงแล้ว
+from app.schemas import ChallengeSubmission, AnalyzeOut, ChallengeFeedback, SubmissionIn  # นำเข้า Schema ที่ปรับปรุงแล้ว
 from app.services.model import predict_challenge          # Logic การทำนายและ Flagging
-from app.services.db import get_challenge_items_for_today, get_item_by_path # Logic DB
+from app.services.db import get_challenge_items_for_today, get_item_by_path, get_firebase_service, get_challenge_item_by_ref, save_submission
+from app.services.firebase_service import FirebaseService
 from inference.flags_and_suggestions import (
     extract_signals, run_logic_flags, build_suggestions, compare_reasoning
 )
@@ -27,49 +29,123 @@ def band_from_proba(p: float, t: float) -> str:
 # ----------------------------------------------------
 # 🟢 1. Analysis Submission Endpoint
 # ----------------------------------------------------
-@router.post("/analyze", tags=["analysis"], response_model=AnalyzeOut)
-async def analyze_submission(submission: ChallengeSubmission):
+@router.post(
+    "/analyze",
+    response_model=ChallengeFeedback,
+    tags=["challenges"],
+    summary="Analyze a user's submission for a daily challenge"
+)
+def analyze_submission(
+    submission: SubmissionIn,
+    firebase_service: FirebaseService = Depends(get_firebase_service)
+):
     """
-    Endpoint สำหรับรับ submission ข้อมูลครบชุด และส่งต่อให้ Model วิเคราะห์ (รวมถึง Logic Flagging และ DB Save)
+    รับคำตอบจากผู้ใช้, วิเคราะห์ด้วยโมเดล, บันทึกผล, และส่ง Feedback กลับไป
     """
+    print("\n--- ANALYZING SUBMISSION ---")
+    print(f"Received submission data: {submission.dict()}")
     
-    news_text = submission.news_text # ใช้ชื่อ field จาก Pydantic
-    news_date_key = submission.date_key
-    
-    if not news_text:
-        raise HTTPException(status_code=400, detail="Content text is missing from submission.")
-
     try:
-        # 🤖 เรียกใช้ Service Logic ที่รวมการทำนายและ Logic Flags แล้ว
-        # NOTE: predict_challenge() ใน app/services/model.py ต้องรับผิดชอบการบันทึกข้อมูลลง Firebase
-        analysis_result = predict_challenge(
-            text=news_text, 
-            user_reasoning=submission.user_reasoning,
-            user_label=submission.user_label,
-            urls=submission.user_urls, # ใช้ชื่อ field จาก Pydantic
-            user_id="anonymous", # ⚠️ ต้องส่ง user_id จริงเข้ามาจาก Frontend/Auth
-            news_id=submission.news_id,
+        # 1. ดึงข้อมูลข่าวจาก DB
+        item_data = get_challenge_item_by_ref(firebase_service, submission.itemRef)
+        if not item_data:
+            raise HTTPException(status_code=404, detail=f"Item with ref '{submission.itemRef}' not found.")
+
+        news_text = item_data.get('text')
+        if news_text is None:
+            raise HTTPException(status_code=500, detail=f"Item '{submission.itemRef}' is missing 'text' data.")
+
+        # 2. วิเคราะห์ด้วยโมเดล เพื่อเอาคำตอบของ AI และ Clue ที่ประมวลผลแล้ว
+        analysis_data = predict_challenge(
+            text=news_text,
+            user_label=submission.userLabel,
+            user_reasoning=submission.userReason,
+            urls=[] 
         )
+
+        # 3. ใช้ผลลัพธ์จากโมเดลเป็น "Source of Truth"
+        model_prediction_bool = bool(analysis_data.get("predicted_label", 0))
+        clues_from_model = analysis_data.get("clue_words_analysis", [])
+
+        # 3.1 คำนวณความถูกต้อง (correct) โดยเทียบคำตอบผู้ใช้กับ "คำตอบของโมเดล"
+        is_correct = (submission.userLabel == model_prediction_bool)
+
+        # ✅ --- START: LOGIC การคำนวณคะแนนใหม่ ---
+        final_score = 0
         
-        # เพิ่ม Metadata กลับเข้าไปในผลลัพธ์ (สำหรับตอบกลับ Frontend)
-        # item_id ต้องถูกแยกจาก news_id (เช่น dailyChallenges/2024-01-01/items/news_123)
-        analysis_result["item_id"] = submission.news_id.split('/')[-1] if submission.news_id and '/' in submission.news_id else submission.news_id 
-        analysis_result["date_key"] = news_date_key
+        # 1. ให้คะแนนพื้นฐาน 25 คะแนน ถ้าทาย Label ถูก
+        if is_correct:
+            final_score = 25
         
-        return AnalyzeOut(
-            status="success",
-            data=analysis_result
+        # 2. คำนวณคะแนน Reasoning จาก 75 คะแนนที่เหลือ
+        if clues_from_model:
+            reasoning_points_pool = 75
+            score_per_clue = reasoning_points_pool / len(clues_from_model)
+            
+            for clue in clues_from_model:
+                if clue.get("found_in_reason", False):
+                    if is_correct:
+                        # ถ้า Label ถูก และ Clue ถูก -> ได้คะแนนเต็มส่วน
+                        final_score += score_per_clue
+                    else:
+                        # ถ้า Label ผิด แต่ Clue ถูก -> ยังคงได้คะแนน 1/3 ของส่วนนั้น
+                        final_score += (score_per_clue / 3)
+
+        # 3. ตรวจสอบว่าคะแนนไม่เกิน 100 และปัดเป็นจำนวนเต็ม
+        final_score = min(100, int(final_score))
+
+        # ✅ --- END: LOGIC การคำนวณคะแนนใหม่ ---
+
+        # 3.2 สร้างคำอธิบาย (explanation)
+        if is_correct:
+            explanation_text = f"คุณวิเคราะห์ได้ตรงกับ AI! โมเดลเห็นว่านี่คือ '{'ข่าวจริง' if model_prediction_bool else 'ข่าวปลอม'}'"
+        else:
+            explanation_text = f"มุมมองของคุณต่างจาก AI เล็กน้อย โมเดลวิเคราะห์ว่าเป็น '{'ข่าวจริง' if model_prediction_bool else 'ข่าวปลอม'}'"
+        
+        # 3.3 จัดรูปแบบ suggestions ให้ถูกต้อง
+        suggestions_list = analysis_data.get("suggestions", [])
+        formatted_suggestions = [{"text": s} for s in suggestions_list if isinstance(s, str)]
+
+        # 3.4 รวบรวม Feedback ทั้งหมด
+        final_feedback = {
+            "score": final_score,
+            "correct": is_correct,
+            "explanation": explanation_text,
+            "clue_words_analysis": clues_from_model,
+            "suggestions": formatted_suggestions
+        }
+
+        # 4. เตรียมข้อมูลและบันทึกลง Firebase
+        today_date_key = date.today().strftime('%Y-%m-%d')
+        db_submission_data = {
+            "createdAt": int(datetime.utcnow().timestamp() * 1000),
+            "itemRef": f"items/{submission.itemRef}",
+            "userLabel": submission.userLabel,
+            "userReason": submission.userReason,
+            "score": final_score 
+        }
+        save_submission(
+            firebase_service=firebase_service,
+            user_id=submission.userId,
+            date_key=today_date_key,
+            submission_data=db_submission_data
         )
-    
-    except HTTPException as http_e:
-        # ส่งต่อ error จาก Service 
-        raise http_e
+
+        print("--- ANALYSIS COMPLETE ---")
+        # 5. สร้าง Response กลับไปให้ Frontend
+        return ChallengeFeedback(**final_feedback)
+
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"UNHANDLED MODEL/LOGIC ERROR: {e}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(
-            status_code=500, 
-            detail=f"Internal Logic Error during analysis: {type(e).__name__}. Check Uvicorn console for detailed traceback."
+            status_code=500,
+            detail=f"An unexpected error occurred during analysis: {e}"
         )
+
+
         
 # ----------------------------------------------------
 # 🟢 2. Challenges Today Endpoint

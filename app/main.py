@@ -68,7 +68,7 @@ app.add_middleware(
     CORSMiddleware,
     # ⚠️ กำหนด Origin ของ React Frontend (Port 5173) และ Backend (Port 8000)
     # เพื่อป้องกันปัญหา CORS
-    allow_origins=["http://localhost:5173", "http://localhost:8000"], 
+    allow_origins=["*"], 
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

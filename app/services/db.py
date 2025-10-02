@@ -26,7 +26,7 @@ def get_firebase_service() -> FirebaseService:
     if firebase_service_instance is None:
         try:
             # ใช้อ้างอิงชื่อคลาสจริงจาก services.firebase_service 
-            from services.firebase_service import FirebaseService as RealFirebaseService 
+            from app.services.firebase_service import FirebaseService as RealFirebaseService 
             firebase_service_instance = RealFirebaseService(settings)
         except Exception as e:
             # ควรจัดการ Error ที่นี่หาก Firebase Service เริ่มต้นไม่ได้
@@ -133,3 +133,68 @@ def get_challenge_items_for_today() -> List[Dict[str, Any]] | None:
         results.sort(key=lambda x: x.get('order', float('inf')))
 
     return results
+
+def get_challenge_item_by_ref(
+    firebase_service: FirebaseService,
+    item_ref: str
+) -> Optional[Dict[str, Any]]:
+    """
+    ดึงข้อมูล Challenge Item จาก Firebase โดยใช้ itemRef ที่มาจาก Frontend
+    
+    Args:
+        firebase_service: อินสแตนซ์ FirebaseService
+        item_ref: ID อ้างอิงของ Challenge Item (e.g., 'news_123' หรือ 'items/news_123')
+        
+    Returns:
+        ข้อมูล Dict ของ Challenge Item พร้อม True Label และ Content
+    """
+    if item_ref.startswith('items/'):
+        item_id = item_ref.split('/')[-1]
+    else:
+        item_id = item_ref
+        
+    item_detail_path = f'items/{item_id}'
+    
+    # ⚠️ ใช้ instance ที่ได้รับมาในการเรียก get_data
+    item_data = firebase_service.get_data(item_detail_path)
+    
+    if item_data:
+        # จัดการ Key Name (ถ้า 'text' ไม่มี แต่มี 'content' ให้เปลี่ยน)
+        if 'text' not in item_data and 'content' in item_data:
+            item_data['text'] = item_data['content'] # เก็บ content ไว้ที่ text
+            
+        # ตรวจสอบ true_label (จำเป็นสำหรับคำนวณ 'correct' ใน model.py)
+        if 'true_label' not in item_data:
+            print(f"Warning: Missing 'true_label' for item {item_id}. Assuming 0.")
+            item_data['true_label'] = 0 
+            
+        return item_data
+        
+    return None
+
+# 🟢 ALIAS: สำหรับใช้ใน Depends() ใน FastAPI
+get_db = get_firebase_service 
+
+def save_submission(
+    firebase_service: FirebaseService,
+    user_id: str,
+    date_key: str,
+    submission_data: Dict[str, Any]
+) -> bool:
+    """
+    บันทึกข้อมูลการตอบของผู้ใช้ลงใน Firebase Realtime Database
+    ตามโครงสร้าง: submissions/{user_id}/{date_key}/{submission_id}
+    """
+    try:
+        # สร้าง Path ไปยัง collection ของ user และ date นั้นๆ
+        path = f'submissions/{user_id}/{date_key}'
+        
+        # ใช้ .push() เพื่อให้ Firebase สร้าง unique key (sub_id) ให้โดยอัตโนมัติ
+        submission_ref = firebase_service.root_ref.child(path)
+        submission_ref.push(submission_data)
+        
+        print(f"Successfully saved submission for user '{user_id}' on '{date_key}'.")
+        return True
+    except Exception as e:
+        print(f"ERROR: Could not save submission for user '{user_id}'. Reason: {e}")
+        return False

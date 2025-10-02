@@ -1,9 +1,9 @@
-# backend/app/services/model.py
+# app/services/model.py
 import sys
 from pathlib import Path 
 from typing import Dict, Any, List, Optional
 import json
-import re # สำหรับใช้ใน Logic Flags
+import re
 from fastapi import HTTPException
 from pydantic import BaseModel, Field
 
@@ -11,106 +11,72 @@ from pydantic import BaseModel, Field
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent 
 sys.path.insert(0, str(PROJECT_ROOT)) 
 
-# 🟢 FIX: Import Predictor และ get_predictor จาก inference.predictor
 from inference.predictor import Predictor, get_predictor
 from core.config import settings
-
-# ⚠️ Import Logic Flags ที่จำเป็น
 from inference.flags_and_suggestions import (
     extract_signals, run_logic_flags, build_suggestions, compare_reasoning
 )
 
-# 🔴 REMOVED: ลบฟังก์ชัน get_predictor() ที่ซ้ำซ้อนออกไป (เพราะอยู่ที่ inference/predictor.py แล้ว)
-
-# --------------------------------------------------------
-# 1. Models for API Requests
-# --------------------------------------------------------
-
-class AnalysisRequest(BaseModel):
-    """
-    Pydantic Model สำหรับรับข้อมูลการส่งคำตอบจาก Frontend
-    """
-    user_id: str = Field(..., description="ID ของผู้ใช้ที่ส่งคำตอบ (เช่น 'uid1234')") 
-    news_id: str = Field(..., description="ID ของข่าว (dailyChallenges/{dateKey}/items/{itemId})")
-    news_text: str = Field(..., description="เนื้อหาของข่าวที่จะถูกวิเคราะห์")
-    user_reasoning: str = Field(..., description="เหตุผลในการตัดสินใจของผู้ใช้")
-    user_urls: List[str] = Field(default_factory=list, description="รายการ URL ที่ผู้ใช้อ้างอิง")
-    user_label: Optional[int] = Field(None, description="การตัดสินใจของผู้ใช้ (1=Reliable, 0=Fake)")
-
-
-# --------------------------------------------------------
-# 2. Models for API Responses
-# --------------------------------------------------------
-
-class AnalysisResponse(BaseModel):
-    """Pydantic Model สำหรับรูปแบบการตอบกลับทั่วไป"""
-    status: str
-    data: Optional[Dict[str, Any]] = None
-    detail: Optional[str] = None
-
-# ====================================================================
-# 🟢 New Prediction Function (รวม Logic การทำนายและวิเคราะห์)
-# ====================================================================
-
 def predict_challenge(
-    text: str, 
-    user_reasoning: Optional[str] = "", 
-    user_label: Optional[int] = -1, 
-    urls: Optional[List[str]] = None
+    text: str,
+    user_label: bool,
+    user_reasoning: str,
+    urls: Optional[List[str]],
 ) -> Dict[str, Any]:
     """
-    Service function to perform prediction and post-processing analysis.
+    Service หลักในการวิเคราะห์ข่าว: รับข้อความ, ทำนายผล, เปรียบเทียบเหตุผล, และสร้าง Feedback
     """
     if urls is None:
         urls = []
 
     try:
-        # 1. ดึงอินสแตนซ์ Predictor ที่โหลดไว้แล้ว
+        # 1. โหลดโมเดลและทำนายผล
         predictor = get_predictor()
+        prediction_result = predictor.predict(text)
 
-        # 2. รันโมเดล (เรียก predict() จาก Predictor)
-        # NOTE: Predictor class ใน inference/predictor.py ใช้เมธอด predict(text)
-        pred_result = predictor.predict(text) 
-        
-        # 2.1 แยกผลลัพธ์หลัก
-        label = int(pred_result.get("prediction", 0))
-        probability = float(pred_result.get("score", 0.0))
-        clues = pred_result.get("clues", []) # คาดหวัง 'clues' เป็น List[Dict] เช่นเดียวกับ attn_topk
-        
-        # 3. เตรียม Clue terms สำหรับ Logic Flags
+        label = prediction_result.get("prediction", 0)
+        probability = prediction_result.get("score", 0.0)
+        raw_clues = prediction_result.get("clues", [])
+
+        # ✅ FIX: ประมวลผล Clues ที่ได้จากโมเดลให้เป็นโครงสร้างที่ถูกต้อง
+        clue_words_analysis = []
         clue_terms = []
-        for c in clues:
-            # สมมติว่า clues แต่ละตัวมี key 'span_tokens' เป็น List[str]
-            for t in c.get("span_tokens", []): 
-                if len(t) > 1 and t.isalnum():
-                    clue_terms.append(t.lower())
-        clue_terms = list(dict.fromkeys(clue_terms))[:12]
+        if raw_clues:
+            # ดึง list ของคำ (token) ออกมา
+            clue_terms = [c.get('token', '').strip().lower() for c in raw_clues]
+            
+            # สร้าง list of dicts สำหรับ `clue_words_analysis`
+            for clue_data in raw_clues:
+                clue_word = clue_data.get('token', '').strip()
+                if not clue_word:
+                    continue
+                
+                # ตรวจสอบว่าผู้ใช้ได้กล่าวถึงคำใบ้นี้ในเหตุผลหรือไม่
+                found = clue_word.lower() in user_reasoning.lower() if user_reasoning else False
+                
+                analysis_text = "คำนี้เป็นหนึ่งในปัจจัยสำคัญที่ AI ใช้ในการตัดสินใจ"
+                
+                clue_words_analysis.append({
+                    "word": clue_word,
+                    "analysis": analysis_text,
+                    "found_in_reason": found
+                })
 
-        # 4. เทียบเหตุผลผู้ใช้ (Logic Flags)
-        entities = list({m.group(0).lower() for m in re.finditer(r"[A-Za-zก-๙]+", text) if len(m.group(0)) > 3})[:20]
-        evidence_match, overlap_ratio = compare_reasoning(user_reasoning, clue_terms, entities)
-
+        # 3. วิเคราะห์ด้วย Logic-based rules
         signals = extract_signals(text, user_reasoning, urls)
-        flags = run_logic_flags(signals, overlap_ratio, user_label, label)
+        evidence_match, overlap_ratio = compare_reasoning(user_reasoning, clue_terms, [])
+        flags = run_logic_flags(signals, overlap_ratio, user_label, bool(label))
         suggestions_data = build_suggestions(flags)
-
-        # 5. รวบรวมผลลัพธ์และจัดรูปแบบ
-        # NOTE: เปลี่ยน f["flag_name"] เป็น f["code"] เพื่อให้สอดคล้องกับ run_logic_flags
+        
+        # 4. รวบรวมผลลัพธ์ทั้งหมดเพื่อส่งกลับไปให้ analyze.py
         return {
             "predicted_label": label,
             "probability": probability,
-            # ต้องแปลง Dict clues เป็น JSON string เพื่อให้ตรงกับ Pydantic List[str] ใน AnalyzeResponse
-            "clues": [json.dumps(c) for c in clues], 
-            "logic_flags": {f["code"]: f.get("reason", "") for f in flags}, 
-            # 🟢 FIX: ใช้ 'text' ใน suggestion แทน 'suggestion' ตาม build_suggestions
-            "suggestions": [s["text"] for s in suggestions_data if "text" in s] 
+            "suggestions": [s.get("text", "") for s in suggestions_data],
+            "clue_words_analysis": clue_words_analysis # ส่งข้อมูลที่ประมวลผลแล้วกลับไป
         }
 
-    except RuntimeError as e:
-        # ดักจับ Error หากโมเดลโหลดไม่สำเร็จ
-        print(f"ERROR: Cannot predict, model not available. {e}")
-        raise HTTPException(status_code=500, detail="Model Service is not initialized.")
     except Exception as e:
-        # ดักจับ Error อื่นๆ
-        print(f"UNEXPECTED ERROR during prediction: {e}")
-        raise HTTPException(status_code=500, detail=f"Unexpected Error during analysis: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred in model service: {e}")

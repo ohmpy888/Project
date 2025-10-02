@@ -10,13 +10,11 @@ from functools import lru_cache
 
 # Fix module import paths
 import sys
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT)) 
 
 from core.config import settings 
-# 🟢 Import CNN_BiLSTM_Attn จาก model_def.py
 from inference.model_def import CNN_BiLSTM_Attn 
-# 🟢 Import simple_tokenize จาก tokenizer.py
 from inference.tokenizer import simple_tokenize 
 
 # Global constants
@@ -24,147 +22,110 @@ POS_LABEL = 1
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 PAD_IDX = settings.PAD_IDX
 
-# --------------------------------------------------------------------
-# Predictor Class 
-# --------------------------------------------------------------------
-
 class Predictor:
-    """
-    Class สำหรับโหลดโมเดล, vocab, threshold และทำนายผล 
-    """
-    
     def __init__(self, model_path: str, vocab_path: str, threshold_path: str):
-        # 1. Load Vocab (Logic from previous successful fix)
+        
+        # --- Logic การโหลด Vocab (ยืดหยุ่น) ---
         print(f"Loading vocab from: {vocab_path}")
         with open(vocab_path, 'r', encoding='utf-8') as f:
             loaded_vocab = json.load(f)
 
-        vocab_list = None
-        
         if isinstance(loaded_vocab, list):
-            vocab_list = loaded_vocab
-            print("INFO: Vocab loaded as List. Using positional index.")
+            self.word_to_ix = {token: i for i, token in enumerate(loaded_vocab)}
         elif isinstance(loaded_vocab, dict):
-            if 'itos' in loaded_vocab and isinstance(loaded_vocab['itos'], list):
-                vocab_list = loaded_vocab['itos']
-                print(f"INFO: Vocab loaded as Dict containing 'itos' list with {len(vocab_list)} tokens.")
-            elif all(isinstance(v, int) for v in loaded_vocab.values()):
-                self.vocab = loaded_vocab
-                self.idx_to_token = {idx: token for token, idx in self.vocab.items()}
-                print(f"INFO: Vocab loaded as direct token:index map with {len(self.vocab)} tokens.")
-                vocab_list = None 
-            else:
-                 raise ValueError("Vocabulary dictionary is not in the expected format (missing 'itos' key or values are not integers).")
+            if 'word_to_ix' in loaded_vocab: self.word_to_ix = loaded_vocab['word_to_ix']
+            elif 'itos' in loaded_vocab: self.word_to_ix = {token: i for i, token in enumerate(loaded_vocab['itos'])}
+            elif all(isinstance(v, int) for v in loaded_vocab.values()): self.word_to_ix = loaded_vocab
+            else: raise ValueError("Unsupported vocabulary dictionary format.")
         else:
-            raise ValueError(f"Vocabulary file format is neither a list nor a dictionary: {type(loaded_vocab)}")
+            raise ValueError(f"Unsupported vocabulary file format: {type(loaded_vocab)}")
 
-        if vocab_list is not None:
-            self.vocab = {token: i for i, token in enumerate(vocab_list)}
-            self.idx_to_token = {i: token for i, token in enumerate(vocab_list)}
+        if not hasattr(self, 'word_to_ix') or not self.word_to_ix:
+            raise RuntimeError("Failed to correctly parse the vocabulary file.")
+            
+        self.unk_idx = self.word_to_ix.get(settings.UNK_TOKEN, 1)
 
-        if not hasattr(self, 'vocab') or not self.vocab:
-            raise RuntimeError("Failed to finalize vocabulary maps. Vocab is empty or incorrectly formatted.")
-        
-        # 2. Load Threshold
+        # ✅ --- START: แก้ไข Logic การโหลด Threshold ---
+        print(f"Loading threshold from: {threshold_path}")
         try:
-            print(f"Loading threshold from: {threshold_path}")
-            with open(threshold_path, 'r', encoding='utf-8') as f:
+            with open(threshold_path, 'r') as f:
                 thresh_data = json.load(f)
-            self.threshold = float(thresh_data.get("optimal_threshold", settings.DEFAULT_THRESHOLD))
-        except Exception as e:
-            print(f"Warning: Could not load threshold ({e}). Using default: {settings.DEFAULT_THRESHOLD}")
+                # ทำให้รองรับทั้ง key 'optimal_threshold' และ 'threshold'
+                if 'optimal_threshold' in thresh_data:
+                    self.threshold = thresh_data['optimal_threshold']
+                elif 'threshold' in thresh_data:
+                    self.threshold = thresh_data['threshold']
+                else:
+                    raise KeyError("Neither 'optimal_threshold' nor 'threshold' key found.")
+            print(f"INFO: Using optimal threshold: {self.threshold}")
+        except (FileNotFoundError, KeyError) as e:
             self.threshold = settings.DEFAULT_THRESHOLD
+            print(f"Warning: Could not load optimal threshold ({e}). Using default: {self.threshold}")
+        # ✅ --- END: แก้ไข Logic การโหลด Threshold ---
 
-        # 3. Initialize Model Structure
+        # --- สร้างสถาปัตยกรรมโมเดล ---
+        print("Initializing model architecture...")
         self.model = CNN_BiLSTM_Attn(
-            vocab_size=len(self.vocab), 
-            emb_dim=settings.EMB_DIM, 
-            cnn_channels=settings.CNN_CHANNELS, 
-            kernel_sizes=settings.KERNEL_SIZES, 
-            lstm_hidden=settings.LSTM_HIDDEN, 
-            lstm_layers=settings.LSTM_LAYERS, 
-            bidir=settings.BIDIR, 
-            dropout=settings.DROPOUT
-        )
+            vocab_size=len(self.word_to_ix),
+            emb_dim=settings.EMB_DIM,
+            cnn_channels=settings.CNN_CHANNELS,
+            kernel_sizes=settings.KERNEL_SIZES,
+            lstm_hidden=settings.LSTM_HIDDEN,
+            lstm_layers=settings.LSTM_LAYERS,
+            bidir=settings.BIDIR,
+            dropout=settings.DROPOUT,
+        ).to(DEVICE)
         
-        # 4. Load Model Weights
-        print(f"Loading model weights from: {model_path}")
-        
-        # 🟢 FIX: โหลด Checkpoint และดึงเฉพาะ State Dict ที่ต้องการ
+        # --- Logic การโหลด Model Weights ---
+        print(f"Loading model checkpoint from: {model_path}")
         checkpoint = torch.load(model_path, map_location=DEVICE)
         
         if isinstance(checkpoint, dict) and 'model_state' in checkpoint:
-            # ถ้า Checkpoint เป็น Dictionary และมีคีย์ 'model_state' ให้ใช้ค่านั้น
-            print("INFO: Extracting 'model_state' from Checkpoint dict.")
             state_dict = checkpoint['model_state']
-        elif isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
-            # บางครั้งอาจใช้ 'state_dict' (เผื่อไว้)
-            print("INFO: Extracting 'state_dict' from Checkpoint dict.")
-            state_dict = checkpoint['state_dict']
+            print("INFO: Extracted 'model_state' from checkpoint file.")
         else:
-            # ถ้า Checkpoint เป็น State Dict โดยตรง หรืออยู่ในรูปแบบอื่นที่ไม่รู้จัก
-            print("INFO: Assuming Checkpoint is a raw State Dict.")
             state_dict = checkpoint
-            
+            print("INFO: Checkpoint file is assumed to be a raw state_dict.")
+
         self.model.load_state_dict(state_dict)
-        self.model.to(DEVICE).eval()
-        
-        self.max_len = settings.MAX_LEN
-        self.pad_idx = settings.PAD_IDX
+        self.model.eval()
 
-    # ------------------------------------------------
-    # Private Helpers (No change in logic here)
-    # ------------------------------------------------
-    
     def _encode_and_pad(self, text: str) -> Tuple[torch.Tensor, List[str]]:
-        """ Tokenize, map to indices, and pad/truncate. """
-        tokens = simple_tokenize(text) 
-        unk_idx = self.vocab.get(settings.UNK_TOKEN, 1) 
-        indices = [self.vocab.get(token, unk_idx) for token in tokens] 
-        
-        if len(indices) < self.max_len:
-            padding = [self.pad_idx] * (self.max_len - len(indices))
-            padded_indices = indices + padding
-        else:
-            padded_indices = indices[:self.max_len]
-            tokens = tokens[:self.max_len]
+        tokens = simple_tokenize(text)
+        if not tokens:
+            return None, []
             
-        tensor = torch.LongTensor(padded_indices).unsqueeze(0).to(DEVICE)
-        return tensor, tokens 
+        indexed = [self.word_to_ix.get(t, self.unk_idx) for t in tokens]
+        tensor = torch.LongTensor(indexed).unsqueeze(0).to(DEVICE)
+        return tensor, tokens
 
-    def _extract_clues(self, alpha: torch.Tensor, actual_tokens: List[str], min_t: int) -> List[Dict[str, Any]]:
-        """ Extracts top attention weights as clues. """
-        alpha_np = alpha.squeeze(0).cpu().numpy()[:min_t]
-        x_short = np.linspace(0, 1, len(alpha_np))
-        f = interp1d(x_short, alpha_np, kind='linear', fill_value="extrapolate")
-        x_long = np.linspace(0, 1, len(actual_tokens))
-        stretched_alpha = f(x_long)
-        sorted_indices = np.argsort(stretched_alpha)[::-1]
+    def _extract_clues(self, alpha: torch.Tensor, tokens: List[str]) -> List[Dict[str, Any]]:
+        if not tokens: return []
+        scores = alpha.squeeze(0).cpu().numpy()
         
-        clues_list = []
-        seen_tokens = set()
-        for i in range(len(actual_tokens)):
-            idx = sorted_indices[i]
-            token = actual_tokens[idx]
-            weight = float(stretched_alpha[idx])
-            
-            if len(clues_list) >= 10: break
-                
-            if weight > 0.01 and len(token) > 1 and token not in seen_tokens:
-                 clues_list.append({"span_tokens": [token], "weight": weight})
-                 seen_tokens.add(token)
-        return clues_list
+        if len(scores) != len(tokens):
+            x_orig = np.linspace(0, 1, len(scores))
+            x_new = np.linspace(0, 1, len(tokens))
+            scores = np.interp(x_new, x_orig, scores)
 
-    # ------------------------------------------------
-    # Main Public Method 
-    # ------------------------------------------------
+        num_clues = max(3, int(len(tokens) * 0.15))
+        top_indices = np.argsort(scores)[-num_clues:]
+        
+        clues = []
+        for i in top_indices:
+            if i < len(tokens):
+                clues.append({"token": tokens[i], "score": round(float(scores[i]), 4)})
+        
+        clues.sort(key=lambda x: x["score"], reverse=True)
+        return clues
 
     def predict(self, text: str) -> Dict[str, Any]:
-        """ Main prediction function. Return prediction, score, clues. """
-        if not text:
+        if not text.strip():
             return {"prediction": 0, "score": 0.0, "clues": []}
 
         input_tensor, actual_tokens = self._encode_and_pad(text)
+        if input_tensor is None:
+            return {"prediction": 0, "score": 0.0, "clues": []}
         
         with torch.no_grad():
             logits, alpha, min_t = self.model(input_tensor)
@@ -173,14 +134,9 @@ class Predictor:
         score = probs[0, POS_LABEL].item() 
         prediction = 1 if score >= self.threshold else 0
         
-        clues = self._extract_clues(alpha, actual_tokens, min_t)
+        clues = self._extract_clues(alpha, actual_tokens)
         
         return {"prediction": prediction, "score": score, "clues": clues}
-
-
-# --------------------------------------------------------------------
-# Predictor Initialization (Singleton)
-# --------------------------------------------------------------------
 
 @lru_cache(maxsize=1)
 def get_predictor() -> Predictor:
@@ -196,5 +152,5 @@ def get_predictor() -> Predictor:
         return predictor_instance
     except Exception as e:
         print(f"CRITICAL ERROR: Failed to initialize Predictor: {e}")
-        # ⚠️ เปลี่ยนการ Raise เป็น RuntimeError เพื่อให้ Model Service ดักจับได้
-        raise RuntimeError(f"Model initialization failed: {e}. Check model files and configuration.")
+        raise RuntimeError("Could not initialize the ML model predictor.")
+

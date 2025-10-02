@@ -1,13 +1,26 @@
 # inference/tokenizer.py
 # -*- coding: utf-8 -*-
 import re
-from core.config import settings # ⚠️ Import settings
+from core.config import settings 
+from typing import List
 
-def simple_tokenize(text: str):
+def simple_tokenize(text: str) -> List[str]:
+    """ Tokenizer function to preprocess text based on model training settings. """
     if text is None: return []
     s = str(text)
-    if settings.LOWERCASE: s = s.lower() # ⚠️ ใช้ค่าจาก settings
+    
+    # ใช้ค่า LOWERCASE จาก settings
+    if settings.LOWERCASE: 
+        s = s.lower() 
+        
+    # ลบ HTML tags และ URLs
     s = re.sub(r"<.*?>|https?://\S+|www\.\S+", " ", s)
+    
+    # จัดการช่องว่างและตัดขอบ
     s = re.sub(r"\s+", " ", s).strip()
-    tokens = re.findall(r"[a-zA-Z0-9_]+|[^\s\w]", s)
+    
+    # ค้นหาสัญลักษณ์และคำภาษาไทย/อังกฤษ (ตามที่โมเดลเทรนมา)
+    # [a-zA-Z0-9_]+ คือคำปกติ | [^\s\w] คือสัญลักษณ์
+    tokens = re.findall(r"[a-zA-Z0-9_]+|[^()\s\w]", s)
+    
     return tokens

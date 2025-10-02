@@ -1,69 +1,108 @@
-# app/routes/analyze.py (ฉบับแก้ไข)
-from fastapi import APIRouter, HTTPException
-from app.schemas import AnalyzeIn, AnalyzeOut
-from app.services.model import get_predictor
-from app.services.db import get_news_text_by_id # ⬅️ ใช้ชื่อเดิมที่แก้แล้ว
+# app/routes/analyze.py
+# -*- coding: utf-8 -*-
+from fastapi import APIRouter, HTTPException, Depends
+from pydantic import BaseModel 
+from typing import List, Dict, Any, Optional
+
+# === Import Dependencies & Logic ===
+from app.schemas import ChallengeSubmission, AnalyzeOut  # นำเข้า Schema ที่ปรับปรุงแล้ว
+from app.services.model import predict_challenge          # Logic การทำนายและ Flagging
+from app.services.db import get_challenge_items_for_today, get_item_by_path # Logic DB
 from inference.flags_and_suggestions import (
     extract_signals, run_logic_flags, build_suggestions, compare_reasoning
 )
 
 router = APIRouter()
 
+# ----------------------------------------------------
+# ⚠️ Utility Function 
+# ----------------------------------------------------
 def band_from_proba(p: float, t: float) -> str:
+    """คำนวณ Band ความแตกต่างของคะแนนโมเดลกับค่า Threshold"""
     d = abs(p - t)
     if d >= 0.35: return "high"
     if d >= 0.15: return "medium"
     return "low"
 
-@router.post("/analyze", response_model=AnalyzeOut)
-def analyze(inp: AnalyzeIn):
-    # 1) หา text ข่าว
-    news_text = None
-    if inp.text and inp.text.strip():
-        news_text = inp.text
-    elif inp.news_id:
-        try:
-            # ⚠️ เรียก DB Service เพื่อดึง Text ข่าวจาก Firebase
-            news_text = get_news_text_by_id(inp.news_id) 
-        except Exception as e:
-            # ใช้ HTTPException 404
-            raise HTTPException(status_code=404, detail=f"news_id '{inp.news_id}' not found in Firebase: {e}")
-    else:
-        raise HTTPException(status_code=400, detail="must provide either text or news_id.")
+# ----------------------------------------------------
+# 🟢 1. Analysis Submission Endpoint
+# ----------------------------------------------------
+@router.post("/analyze", tags=["analysis"], response_model=AnalyzeOut)
+async def analyze_submission(submission: ChallengeSubmission):
+    """
+    Endpoint สำหรับรับ submission ข้อมูลครบชุด และส่งต่อให้ Model วิเคราะห์ (รวมถึง Logic Flagging และ DB Save)
+    """
+    
+    news_text = submission.news_text # ใช้ชื่อ field จาก Pydantic
+    news_date_key = submission.date_key
     
     if not news_text:
-        raise HTTPException(status_code=400, detail="News text is empty after fetching.")
+        raise HTTPException(status_code=400, detail="Content text is missing from submission.")
 
-    # 2) รันโมเดล + อธิบาย
-    predictor = get_predictor()
-    pred = predictor.predict(news_text)
-    p = float(pred["proba_pos"])
-    label = int(pred["label"])
-    clues = pred["attn_topk"]
+    try:
+        # 🤖 เรียกใช้ Service Logic ที่รวมการทำนายและ Logic Flags แล้ว
+        # NOTE: predict_challenge() ใน app/services/model.py ต้องรับผิดชอบการบันทึกข้อมูลลง Firebase
+        analysis_result = predict_challenge(
+            text=news_text, 
+            user_reasoning=submission.user_reasoning,
+            user_label=submission.user_label,
+            urls=submission.user_urls, # ใช้ชื่อ field จาก Pydantic
+            user_id="anonymous", # ⚠️ ต้องส่ง user_id จริงเข้ามาจาก Frontend/Auth
+            news_id=submission.news_id,
+        )
+        
+        # เพิ่ม Metadata กลับเข้าไปในผลลัพธ์ (สำหรับตอบกลับ Frontend)
+        # item_id ต้องถูกแยกจาก news_id (เช่น dailyChallenges/2024-01-01/items/news_123)
+        analysis_result["item_id"] = submission.news_id.split('/')[-1] if submission.news_id and '/' in submission.news_id else submission.news_id 
+        analysis_result["date_key"] = news_date_key
+        
+        return AnalyzeOut(
+            status="success",
+            data=analysis_result
+        )
+    
+    except HTTPException as http_e:
+        # ส่งต่อ error จาก Service 
+        raise http_e
+    except Exception as e:
+        print(f"UNHANDLED MODEL/LOGIC ERROR: {e}")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Internal Logic Error during analysis: {type(e).__name__}. Check Uvicorn console for detailed traceback."
+        )
+        
+# ----------------------------------------------------
+# 🟢 2. Challenges Today Endpoint
+# ----------------------------------------------------
+@router.get("/challenges/today", response_model=List[Dict[str, Any]], tags=["challenges"])
+def get_today_challenges():
+    """
+    ดึงรายการโจทย์ทั้งหมดสำหรับวันปัจจุบันจาก Firebase 
+    """
+    try:
+        challenges = get_challenge_items_for_today()
+        if not challenges:
+            raise HTTPException(status_code=404, detail="No daily challenges found for today.")
+        
+        return challenges 
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error fetching daily challenges: {e}")
+        raise HTTPException(status_code=500, detail="Internal error during challenge fetch.")
 
-    # 3) เทียบเหตุผลผู้ใช้กับ clues/entities
-    clue_terms = []
-    for c in clues:
-        for t in c["span_tokens"]:
-            if len(t) > 1 and t.isalnum():
-                clue_terms.append(t.lower())
-    clue_terms = list(dict.fromkeys(clue_terms))[:12]
-
-    import re
-    entities = list({m.group(0).lower() for m in re.finditer(r"[A-Za-zก-๙]+", news_text) if len(m.group(0)) > 3})[:20]
-    evidence_match, overlap_ratio = compare_reasoning(inp.user_reasoning or "", clue_terms, entities)
-
-    # 4) flags + suggestions
-    signals = extract_signals(news_text, inp.user_reasoning or "", inp.urls or [])
-    flags = run_logic_flags(signals, overlap_ratio, inp.user_label, label)
-    suggestions = build_suggestions(flags)
-
-    return AnalyzeOut(
-        news_id=inp.news_id, 
-        news_text=news_text, # ⬅️ ส่ง Text ข่าวที่ใช้ในการวิเคราะห์กลับไป
-        user_id=inp.user_id,
-        model_label=label, proba=p, threshold=predictor.threshold,
-        confidence_band=band_from_proba(p, predictor.threshold),
-        model_clues=clues, evidence_match=evidence_match, overlap_ratio=overlap_ratio,
-        logic_flags=flags, suggestions=suggestions, model_version="ckpt::best_model.pt"
-    )
+# ----------------------------------------------------
+# 🟢 3. Debug Database Endpoint
+# ----------------------------------------------------
+@router.get("/debug-db/{path:path}", tags=["debug"])
+def debug_db(path: str):
+    """
+    Endpoint สำหรับดึงข้อมูลดิบจาก Firebase ตามพาธที่ระบุ
+    """
+    data = get_item_by_path(path)
+    
+    if data is None:
+        raise HTTPException(status_code=404, detail=f"Data not found at path: {path}") 
+    
+    return data

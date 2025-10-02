@@ -4,10 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class CNN_BiLSTM_Attn(nn.Module):
-    """
-    ตรงกับรุ่นที่คุณเทรน: CNN (หลาย kernel) -> concat -> BiLSTM -> Attention -> FC
-    forward คืน (logits, alpha) โดย alpha เป็น attention ต่อ time-step หลัง LSTM
-    """
+    """ The custom trained model definition. """
     def __init__(self, vocab_size, emb_dim, cnn_channels, kernel_sizes, lstm_hidden, lstm_layers, bidir, dropout, num_classes=2):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, emb_dim, padding_idx=0)
@@ -40,10 +37,13 @@ class CNN_BiLSTM_Attn(nn.Module):
         # align time by cropping to shortest T'
         min_t = min(cf.size(1) for cf in conv_feats)
         conv_feats = [cf[:, :min_t, :] for cf in conv_feats]
-        feats = torch.cat(conv_feats, dim=2)     # (B, T', C*len(K))
-        lstm_out, _ = self.lstm(feats)           # (B, T', H*(2))
-        alpha = self.attn_w(lstm_out)            # (B, T', 1)
-        alpha = torch.softmax(alpha.squeeze(-1), dim=1)    # (B, T')
-        context = torch.sum(lstm_out * alpha.unsqueeze(-1), dim=1)  # (B, 2H)
-        logits = self.fc(self.dropout(context))  # (B, 2)
-        return logits, alpha
+        feats = torch.cat(conv_feats, dim=-1)    # (B, T', C*K)
+        
+        lstm_out, _ = self.lstm(feats)           # (B, T', Attn_dim)
+        attn_weights = torch.softmax(self.attn_w(lstm_out), dim=1) # (B, T', 1)
+        context = torch.sum(lstm_out * attn_weights, dim=1)        # (B, Attn_dim)
+        
+        out = self.dropout(context)
+        logits = self.fc(out)
+        
+        return logits, attn_weights.squeeze(-1), min_t

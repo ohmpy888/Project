@@ -23,6 +23,8 @@ class Settings:
     # ------------------------------------
     MODEL_PATH: str = os.getenv("MODEL_PATH", str(CKPT_DIR / "best_model.pt"))
     THRESH_PATH: str = os.getenv("THRESHOLD_PATH", str(CKPT_DIR / "threshold.json"))
+    DEFAULT_THRESHOLD: float = 0.5 # ⬅️ (ค่าสำรอง)
+    VOCAB_PATH: str = os.getenv("VOCAB_PATH", str(CKPT_DIR / "vocab.json"))
     
     # ------------------------------------
     # 3. MODEL HYPERPARAMETERS (ค่าที่จำเป็นต้องใช้ในการสร้างโมเดล)
@@ -30,6 +32,8 @@ class Settings:
     LOWERCASE      = True
     MAX_LEN        = 256
     PAD_IDX        = 0
+    # 🟢 FIX: เพิ่ม UNK_TOKEN ที่หายไป
+    UNK_TOKEN      = "<unk>"
 
     EMB_DIM        = 200
     CNN_CHANNELS   = 128
@@ -37,16 +41,7 @@ class Settings:
     LSTM_HIDDEN    = 128
     LSTM_LAYERS    = 1
     BIDIR          = True
-    DROPOUT        = 0.3
-    NUM_CLASSES    = 2
+    DROPOUT        = 0.5
 
-    # ------------------------------------
-    # 4. FASTAPI / CORS Settings
-    # ------------------------------------
-    PROJECT_NAME: str = "Real-Fake News Detector API"
-    VERSION: str = "1.0.0"
-    ALLOW_ORIGINS: List[str] = [
-        os.getenv("FRONTEND_ORIGIN", "http://localhost:5173"),
-    ]
-    
+# ใช้งาน Singleton Instance 
 settings = Settings()
